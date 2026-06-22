@@ -42,7 +42,11 @@ ansible-multicred/
 ├── site.yml                         # main playbook (run this)
 ├── pyproject.toml                   # python deps for the controller (uv)
 ├── group_vars/all.yml               # protocols, command, timeout defaults
-├── inventory/hosts.yml              # your devices
+├── inventory/
+│   ├── hosts.yml                    # your devices (edit or generate from CSV)
+│   └── devices.csv.template         # CSV template for csv_to_hosts.py
+├── scripts/
+│   └── csv_to_hosts.py             # generate hosts.yml from a CSV device list
 ├── files/
 │   ├── credentials.yml              # ORDERED credential list (labels + refs)
 │   └── secrets.yml                  # the actual passwords (ENCRYPT THIS)
@@ -58,11 +62,13 @@ ansible-multicred/
    uv sync
    ```
 
-2. Edit `inventory/hosts.yml` — list every device under `network_devices`.
-   Set `device_platform` per host (`cisco_ios`, `cisco_xe`, `cisco_nxos`,
-   `cisco_asa`, `cisco_xr`). The module auto-selects the right Netmiko
-   driver for SSH vs Telnet. Optionally pin `device_port` or override
-   `login_protocols` per host (e.g. a telnet-only legacy box).
+2. Populate `inventory/hosts.yml` — either edit it directly or generate it
+   from a CSV (see [Generating the inventory from CSV](#generating-the-inventory-from-csv)).
+   Each device needs `ansible_host` (IP or FQDN) and `device_platform`
+   (`cisco_ios`, `cisco_xe`, `cisco_nxos`, `cisco_asa`, `cisco_xr`).
+   The module auto-selects the right Netmiko driver for SSH vs Telnet.
+   Optionally pin `device_port` or override `login_protocols` per host
+   (e.g. a telnet-only legacy box).
 
 3. Put the ordered credential list in `files/credentials.yml`. Each entry has
    a friendly `label` (what shows up in the CSV), a `username`, a `password`
@@ -72,6 +78,56 @@ ansible-multicred/
    ```bash
    ansible-vault encrypt files/secrets.yml
    ```
+
+## Generating the inventory from CSV
+
+`scripts/csv_to_hosts.py` converts a CSV device list into `inventory/hosts.yml`
+so you don't have to hand-edit YAML.
+
+**CSV format** (see `inventory/devices.csv.template`):
+
+```
+name,ip address,device type
+core-sw01,10.10.1.1,ios
+dist-rtr01,10.10.2.1,ios-xe
+nx-sw01,10.10.9.5,nxos
+```
+
+Lines starting with `#` are treated as comments and ignored.
+
+**Accepted `device type` values:**
+
+| Short alias | Full Netmiko driver |
+|---|---|
+| `ios` | `cisco_ios` |
+| `ios-xe` / `xe` | `cisco_xe` |
+| `nxos` | `cisco_nxos` |
+| `asa` | `cisco_asa` |
+| `ios-xr` / `xr` | `cisco_xr` |
+
+Full driver names (`cisco_ios`, `cisco_xe`, …) are also accepted directly.
+
+**Usage:**
+
+```bash
+# Generate inventory/hosts.yml from your CSV
+python scripts/csv_to_hosts.py inventory/devices.csv
+
+# Overwrite an existing hosts.yml
+python scripts/csv_to_hosts.py inventory/devices.csv --force
+
+# Preview the output without writing (dry run)
+python scripts/csv_to_hosts.py inventory/devices.csv --dry-run
+
+# Use a custom output path
+python scripts/csv_to_hosts.py devices.csv -o /tmp/hosts.yml
+
+# Allow unknown device types (passed through verbatim with a warning)
+python scripts/csv_to_hosts.py inventory/devices.csv --allow-unknown
+```
+
+The script validates every row (hostname format, IP/FQDN syntax, duplicate
+names, known device type) and prints clear errors before writing anything.
 
 ## Run
 
