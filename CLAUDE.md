@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What this project does
 
-This is a **Multi-Credential / Multi-Protocol Cisco Login Auditor** built with Ansible. It tests login connectivity across a list of network devices when there is no single shared credential, cycling through an ordered list of credentials and protocols (SSH then Telnet by default) and stopping at the first working combination per device. Results are written to `output/login_results.csv`.
+This is a **Multi-Credential / Multi-Protocol Cisco Public-IP Inventory** tool built with Ansible. It logs in to a list of network devices when there is no single shared credential, cycling through an ordered list of credentials and protocols (Telnet then SSH by default) and stopping at the first working combination per device. Once logged in it reads the running config, extracts every interface's IPv4 address, keeps only the **public (globally routable)** ones, and writes them — with mask, interface, and calculated subnet ID — to `output/public_ip_inventory.csv`. Devices with no public IP are omitted from the report.
 
 ## Dependencies
 
@@ -19,17 +19,14 @@ pip install netmiko paramiko ansible-core
 ## Running the playbook
 
 ```bash
-# Default command ("show version") against all devices
-ansible-playbook -i hosts.yml site.yml --ask-vault-pass
+# Default: reads running config with "show running-config" on all devices
+ansible-playbook -i inventory/hosts.yml site.yml --ask-vault-pass
 
-# Custom command
-ansible-playbook -i hosts.yml site.yml --ask-vault-pass -e remote_command="show ip interface brief"
-
-# Login-test only (no command)
-ansible-playbook -i hosts.yml site.yml --ask-vault-pass -e remote_command=""
+# Use a scoped config command (e.g. for read-only accounts)
+ansible-playbook -i inventory/hosts.yml site.yml --ask-vault-pass -e interface_command="show running-config interface"
 
 # Control parallelism (default 20)
-ansible-playbook -i hosts.yml site.yml --ask-vault-pass -e batch_size=5
+ansible-playbook -i inventory/hosts.yml site.yml --ask-vault-pass -e batch_size=5
 ```
 
 ## Vault management
@@ -48,21 +45,23 @@ The project is flat (no subdirectory structure enforced at the repo root) with t
 
 | File | Role |
 |---|---|
-| `site.yml` | Main playbook — two plays: one running `multicred_login` role across `network_devices`, then a `localhost` play that merges JSON fragments into the CSV |
-| `multicred_connect.py` | Custom Ansible module — drives Netmiko directly (bypasses `network_cli`) to attempt credential/protocol combinations at runtime |
+| `site.yml` | Main playbook — two plays: one running `multicred_login` role across `network_devices`, then a `localhost` play that merges JSON fragments into the CSV (one row per public IP) |
+| `multicred_connect.py` | Custom Ansible module — drives Netmiko directly (bypasses `network_cli`) to attempt credential/protocol combinations at runtime, then parses the running config for public interface IPs |
 | `hosts.yml` | Inventory — devices under `network_devices` group; per-host `device_platform` selects the Netmiko driver family |
-| `all.yml` | Group vars — global defaults: `login_protocols`, `remote_command`, `login_timeout` |
+| `all.yml` | Group vars — global defaults: `login_protocols`, `interface_command`, `login_timeout` |
 | `credentials.yml` | Ordered credential list (labels + vault variable references); first entry is tried first |
 | `secrets.yml` | Actual passwords (vault variables referenced by `credentials.yml`); **must be encrypted** |
-| `main.yml` | Role tasks — calls the module, builds a result dict, writes a per-host JSON fragment to `output/.fragments/` |
+| `main.yml` | Role tasks — calls the module, builds a result dict (incl. `public_ips`), writes a per-host JSON fragment to `output/.fragments/` |
 
 ### Key design decisions
 
 **Why a custom module instead of `network_cli`?** Ansible's `network_cli` connection plugin requires the protocol and credential to be fixed before the play starts. The custom `multicred_connect` module drives Netmiko directly, enabling the runtime cycling loop.
 
-**Why per-host JSON fragments?** `set_fact` values are not reliably shared across hosts running in parallel forks. Each host writes `output/.fragments/<hostname>.json`; the final localhost play merges them into the CSV, avoiding race conditions.
+**Why per-host JSON fragments?** `set_fact` values are not reliably shared across hosts running in parallel forks. Each host writes `output/.fragments/<hostname>.json` (containing `public_ips`); the final localhost play flattens them into the CSV, avoiding race conditions.
 
-**Credential/protocol iteration order:** Outer loop = credentials (by list position), inner loop = protocols. So credential #1 over SSH is tried first, then credential #1 over Telnet, then credential #2 over SSH, etc.
+**Credential/protocol iteration order:** Outer loop = credentials (by list position), inner loop = protocols. So credential #1 over the first protocol is tried first, then credential #1 over the second, then credential #2, etc. Only the first working combination reads the config.
+
+**Public-IP extraction:** After login the module parses the running config for interface `ip address` lines — both dotted-mask (`ip address 203.0.113.1 255.255.255.0`, IOS/XE/ASA/XR) and CIDR (`ip address 203.0.113.1/24`, NX-OS), including `secondary` addresses. Python's `ipaddress` module classifies each; only `is_global` addresses are kept. The subnet ID is `ip_network(ip/mask, strict=False).network_address`. Devices with zero public IPs are dropped from the CSV via `rejectattr('public_ips', 'equalto', [])` + `subelements`.
 
 **`device_platform` values** map to Netmiko driver families: `cisco_ios`, `cisco_xe`, `cisco_nxos`, `cisco_asa`, `cisco_xr`. The module appends `_telnet` automatically for Telnet connections.
 

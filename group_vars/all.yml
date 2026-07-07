@@ -14,10 +14,13 @@ login_protocols:
   - telnet
   - ssh
 
-# Command to run once logged in. Set to something read-only and safe
-# by default. Override with -e remote_command="..." at runtime, or
-# set to null/'' to skip running any command and just test login.
-remote_command: "show version"
+# Command used to retrieve the interface IP configuration once logged in.
+# Its output is parsed for "ip address" lines (dotted-mask on
+# IOS/IOS-XE/ASA/XR, CIDR on NX-OS), so any command that emits the
+# interface config in that form works. Override with
+# -e interface_command="..." at runtime if needed (e.g. a scoped
+# "show running-config interface" for read-only accounts).
+interface_command: "show running-config"
 
 # Per-attempt connection timeout, seconds.
 login_timeout: 15

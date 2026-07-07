@@ -1,39 +1,53 @@
-# Multi-Credential / Multi-Protocol Cisco Login Auditor (Ansible)
+# Multi-Credential / Multi-Protocol Cisco Public-IP Inventory (Ansible)
 
-Runs a command against a list of Cisco routers/switches when **there is no
-single shared username/password** and devices may speak **SSH or Telnet**.
+Logs in to a list of Cisco routers/switches when **there is no single shared
+username/password** and devices may speak **SSH or Telnet**, then inventories
+the **public IP addresses** configured on their interfaces.
 
 For each device it walks an ordered list of credentials. For each credential
 it tries each protocol in order. It **stops at the first combination that
-works**, then writes a CSV report with the status of every device.
+works**, reads the running config, and extracts every interface's configured
+IPv4 address — keeping only the **public (globally routable)** ones. Private
+(RFC1918), loopback, link-local, CGNAT and other reserved addresses are
+ignored. Devices with no public IP are left out of the report entirely.
 
 ## What you get in the CSV
 
-`output/login_results.csv` columns:
+`output/public_ip_inventory.csv` — **one row per public IP** (a device with
+several public IPs produces several rows; a device with none is omitted):
 
 | column | meaning |
 |---|---|
 | `device_name` | inventory hostname |
-| `ip_address` | resolved `ansible_host` |
-| `status` | `success` or `fail` |
-| `credential_used` | label of the credential that worked (blank if all failed) |
-| `protocol_used` | `ssh` or `telnet` (blank if all failed) |
-| `attempts` | how many combinations were tried |
-| `last_error` | single-line reason for the last failure (blank on success) |
-| `timestamp` | UTC time the device was tested |
+| `management_ip` | the device's management address (resolved `ansible_host`) |
+| `public_ip` | a public IPv4 address configured on an interface |
+| `subnet_mask` | that address's mask in dotted-decimal form |
+| `interface` | the interface the public IP is configured on |
+| `subnet_id` | the network/subnet ID, calculated from the IP + mask |
 
 ## How the cycling works
 
 ```
 for credential in credential_list:        # order = priority, first tried first
-    for protocol in login_protocols:       # e.g. ssh, then telnet
-        try to connect + (optionally) run the command
-        if it works -> record success, STOP this device
+    for protocol in login_protocols:       # e.g. telnet, then ssh
+        try to connect
+        if it works -> pull running config, extract public IPs, STOP this device
 record fail only if every combination was exhausted
 ```
 
-So credential #1 over SSH is tried first; if that fails, credential #1 over
-Telnet; then credential #2 over SSH; and so on.
+So credential #1 over the first protocol is tried first; if that fails,
+credential #1 over the next protocol; then credential #2; and so on. Only the
+first working combination is used to read the config.
+
+## How public IPs are identified
+
+The running config is parsed for interface `ip address` lines in both the
+dotted-mask form (`ip address 203.0.113.1 255.255.255.0`, used by
+IOS/IOS-XE/ASA/XR) and the CIDR form (`ip address 203.0.113.1/24`, used by
+NX-OS), including `secondary` addresses. Each address is classified with
+Python's `ipaddress` module; only **globally routable** addresses are kept.
+The subnet ID is the network address derived from the IP and its mask
+(e.g. `8.8.8.129 / 255.255.255.192` → `8.8.8.128`).
 
 ## Layout
 
@@ -132,24 +146,21 @@ names, known device type) and prints clear errors before writing anything.
 ## Run
 
 ```bash
-# Default command is "show version"
+# Reads the running config with the default command ("show running-config")
 uv run ansible-playbook -i inventory/hosts.yml site.yml --ask-vault-pass
 
-# Run a different command, or just test login with no command:
+# Use a scoped command instead (e.g. for a read-only account):
 uv run ansible-playbook -i inventory/hosts.yml site.yml --ask-vault-pass \
-    -e remote_command="show ip interface brief"
-
-uv run ansible-playbook -i inventory/hosts.yml site.yml --ask-vault-pass \
-    -e remote_command=""        # login-test only, no command run
+    -e interface_command="show running-config interface"
 ```
 
-The CSV lands at `output/login_results.csv`.
+The CSV lands at `output/public_ip_inventory.csv`.
 
 ## Tuning
 
 In `group_vars/all.yml`:
-- `login_protocols` — global protocol order (default `ssh`, then `telnet`).
-- `remote_command` — command to run once logged in.
+- `login_protocols` — global protocol order (default `telnet`, then `ssh`).
+- `interface_command` — command whose output is parsed for interface IPs.
 - `login_timeout` — per-attempt timeout in seconds (default 15).
 
 At the command line:
@@ -160,8 +171,9 @@ At the command line:
 - Passwords live only in `files/secrets.yml`, which should be vault-encrypted.
   They are declared `no_log` in the module, so they are not printed even with
   `-vvv`. (Verified: a `-vvv` run shows zero plaintext password occurrences.)
-- The CSV records the credential **label**, never the password.
-- `output/login_results.csv` is written `0640`.
+- The CSV never contains any credential material — only device names,
+  management IPs, and public interface addressing.
+- `output/public_ip_inventory.csv` is written `0640`.
 
 ## Notes on design
 

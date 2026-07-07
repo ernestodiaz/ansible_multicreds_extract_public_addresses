@@ -6,8 +6,8 @@
 #
 # Optional overrides:
 #   ansible-playbook -i inventory/hosts.yml site.yml \
-#       -e remote_command="show version" \
-#       -e credentials_file=files/credentials.yml
+#       -e interface_command="show running-config" \
+#       -e batch_size=5
 #
 # Requires on the controller:
 #   pip install netmiko paramiko ansible
@@ -15,13 +15,16 @@
 # What it does:
 #   1. For every host in inventory, tries each credential (in order) from
 #      credential_list, and for each credential tries each protocol (in
-#      order) from login_protocols (default: ssh then telnet).
-#   2. Stops at the first successful combination per device.
+#      order) from login_protocols (default: telnet then ssh).
+#   2. Stops at the first successful combination per device, then reads the
+#      running config and extracts the device's PUBLIC interface IP
+#      addresses (mask, interface, and calculated subnet ID).
 #   3. Writes one JSON fragment per host to a scratch dir (avoids
 #      parallel-fork fact-aggregation issues).
-#   4. A final localhost play combines all fragments into one CSV report.
+#   4. A final localhost play merges the fragments into one CSV report with
+#      a row per public IP, skipping devices that have no public IP.
 
-- name: Test multi-credential / multi-protocol login across network devices
+- name: Inspect interface IPs and collect public addresses across network devices
   hosts: network_devices
   gather_facts: false
   strategy: free          # let fast/slow devices proceed independently
@@ -34,13 +37,13 @@
   roles:
     - multicred_login
 
-- name: Compile final CSV report
+- name: Compile final public-IP CSV report
   hosts: localhost
   connection: local
   gather_facts: false
   vars:
     results_fragments_dir: "{{ playbook_dir }}/output/.fragments"
-    csv_output_path: "{{ playbook_dir }}/output/login_results.csv"
+    csv_output_path: "{{ playbook_dir }}/output/public_ip_inventory.csv"
   tasks:
     - name: Find all per-host result fragments
       find:
@@ -79,24 +82,36 @@
       set_fact:
         compiled_results_sorted: "{{ compiled_results | sort(attribute='device_name') }}"
 
-    - name: Write combined CSV report
+    - name: Flatten to one row per public IP (devices without a public IP are dropped)
+      set_fact:
+        public_ip_rows: >-
+          {{
+            compiled_results_sorted
+            | selectattr('public_ips', 'defined')
+            | rejectattr('public_ips', 'equalto', [])
+            | subelements('public_ips')
+            | list
+          }}
+
+    - name: Write public-IP CSV report
       copy:
         dest: "{{ csv_output_path }}"
         mode: "0640"
         content: |
-          device_name,ip_address,status,credential_used,protocol_used,attempts,last_error,timestamp
-          {% for r in compiled_results_sorted %}
-          {{ r.device_name }},{{ r.ip_address }},{{ r.status }},{{ r.credential_used }},{{ r.protocol_used }},{{ r.attempts }},"{{ r.last_error | replace('"', '""') | replace('\n', ' ') | replace('\r', '') }}",{{ r.timestamp }}
+          device_name,management_ip,public_ip,subnet_mask,interface,subnet_id
+          {% for device, addr in public_ip_rows %}
+          {{ device.device_name }},{{ device.management_ip }},{{ addr.public_ip }},{{ addr.netmask }},{{ addr.interface }},{{ addr.subnet_id }}
           {% endfor %}
 
     - name: Summarize outcome
       vars:
-        success_count: "{{ compiled_results_sorted | selectattr('status', 'equalto', 'success') | list | length }}"
-        fail_count: "{{ compiled_results_sorted | selectattr('status', 'equalto', 'fail') | list | length }}"
+        devices_with_public: "{{ compiled_results_sorted | selectattr('public_ips', 'defined') | rejectattr('public_ips', 'equalto', []) | list | length }}"
+        login_failures: "{{ compiled_results_sorted | selectattr('status', 'equalto', 'fail') | list | length }}"
       debug:
         msg: >-
-          Done. {{ success_count }} succeeded, {{ fail_count }} failed,
-          {{ compiled_results_sorted | length }} total.
+          Done. {{ public_ip_rows | length }} public IP(s) across
+          {{ devices_with_public }} device(s); {{ login_failures }} device(s)
+          could not be logged into.
           CSV written to {{ csv_output_path }}
 
     - name: Clean up per-host JSON fragments

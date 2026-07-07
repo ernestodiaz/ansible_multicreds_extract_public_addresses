@@ -3,6 +3,9 @@
 #
 # For every host in play, attempt login using the credential list and
 # protocol list defined in group_vars/all.yml (or overridden per-host/group).
+# On the first working credential/protocol, the module pulls the running
+# config and returns the device's PUBLIC interface IP addresses (with mask,
+# interface and calculated subnet ID).
 #
 # Aggregation note: Ansible runs hosts in parallel forks by default, and
 # facts set with set_fact are NOT reliably shared/merged across hosts that
@@ -19,30 +22,30 @@
     device_type: "{{ device_platform | default('cisco_ios') }}"
     protocols: "{{ login_protocols }}"
     credentials: "{{ credential_list }}"
-    command: "{{ remote_command }}"
+    interface_command: "{{ interface_command }}"
     timeout: "{{ login_timeout | default(15) }}"
   delegate_to: localhost
   register: login_result
-  # Never let a single device's failure stop the whole play; we want a
-  # result row for every device, success or fail.
+  # Never let a single device's failure stop the whole play; we want to
+  # account for every device, success or fail.
   ignore_errors: true
 
 - name: Build result record for {{ inventory_hostname }}
   set_fact:
     device_result:
       device_name: "{{ inventory_hostname }}"
-      ip_address: "{{ ansible_host | default(inventory_hostname) }}"
+      management_ip: "{{ ansible_host | default(inventory_hostname) }}"
       status: "{{ login_result.status | default('fail') }}"
       credential_used: "{{ login_result.credential_used | default('') }}"
       protocol_used: "{{ login_result.protocol_used | default('') }}"
       attempts: "{{ login_result.attempts | default(0) }}"
+      public_ips: "{{ login_result.public_ips | default([]) }}"
       last_error: >-
         {%- if login_result.status | default('fail') == 'success' -%}
         {{ '' }}
         {%- else -%}
         {{ login_result.last_error | default('module_error: ' ~ (login_result.msg | default('unknown')), true) }}
         {%- endif -%}
-      command_output: "{{ login_result.command_output | default('') }}"
       timestamp: "{{ lookup('pipe', 'date -u +%Y-%m-%dT%H:%M:%SZ') }}"
 
 - name: Show result for {{ inventory_hostname }}
@@ -51,7 +54,7 @@
       [{{ device_result.status | upper }}] {{ device_result.device_name }}
       cred={{ device_result.credential_used }}
       proto={{ device_result.protocol_used }}
-      attempts={{ device_result.attempts }}
+      public_ips={{ device_result.public_ips | length }}
       {{ '' if device_result.status == 'success' else 'error=' ~ device_result.last_error }}
 
 - name: Ensure local results-fragments directory exists

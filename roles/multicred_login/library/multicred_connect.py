@@ -4,10 +4,12 @@
 """
 Custom Ansible module: multicred_connect
 
-Attempts to log in to a network device (Cisco IOS/IOS-XE/NX-OS/ASA, etc.)
-using a list of candidate credentials and a list of candidate protocols
-(ssh, telnet). Stops at the first successful combination. Optionally
-runs a command once connected.
+Logs in to a network device (Cisco IOS/IOS-XE/NX-OS/ASA/XR, etc.) using a
+list of candidate credentials and a list of candidate protocols (ssh,
+telnet). It stops at the first successful combination. Once connected, it
+pulls the running configuration, parses every interface's configured IPv4
+address + mask, and returns ONLY the public (globally routable) addresses
+together with the interface they live on and their calculated subnet ID.
 
 This module intentionally does NOT use Ansible's network connection
 plugins (network_cli) because those require the credential/protocol to
@@ -17,6 +19,8 @@ connection directly with Netmiko from inside the module.
 """
 
 from ansible.module_utils.basic import AnsibleModule
+import ipaddress
+import re
 import traceback
 
 NETMIKO_IMPORT_ERROR = None
@@ -77,10 +81,133 @@ def flatten(text):
     return " | ".join(lines)
 
 
+# Matches a configured IPv4 address inside an interface block. Handles both
+# the dotted-mask form used by IOS/IOS-XE/ASA/XR:
+#     ip address 203.0.113.1 255.255.255.0
+#     ipv4 address 203.0.113.1 255.255.255.0   (XR)
+# and the CIDR form used by NX-OS:
+#     ip address 203.0.113.1/24
+# The optional trailing "secondary" keyword is tolerated and ignored.
+_IP_DOTTED_RE = re.compile(
+    r"^(?:ip|ipv4)\s+address\s+"
+    r"(\d{1,3}(?:\.\d{1,3}){3})\s+"
+    r"(\d{1,3}(?:\.\d{1,3}){3})\b"
+)
+_IP_CIDR_RE = re.compile(
+    r"^(?:ip|ipv4)\s+address\s+"
+    r"(\d{1,3}(?:\.\d{1,3}){3})/(\d{1,2})\b"
+)
+_INTERFACE_RE = re.compile(r"^interface\s+(\S+)")
+
+
+def parse_interface_addresses(config_text):
+    """
+    Parse a running-config into a list of configured interface addresses.
+
+    Returns a list of dicts:
+        {"interface": str, "ip": str, "netmask": str, "prefixlen": int}
+
+    Cisco configs indent interface sub-commands beneath a top-level
+    ``interface <name>`` line and terminate each block with a non-indented
+    line (typically ``!``). We track the current interface from the
+    indentation, so an ``ip address`` line is always attributed to the
+    interface it belongs to.
+    """
+    results = []
+    current_if = None
+
+    for raw_line in config_text.splitlines():
+        if not raw_line.strip():
+            continue
+
+        indented = raw_line[0] in (" ", "\t")
+        line = raw_line.strip()
+
+        if not indented:
+            # A top-level line ends any interface block. It might itself be
+            # the start of a new interface block.
+            match = _INTERFACE_RE.match(line)
+            current_if = match.group(1) if match else None
+            continue
+
+        if current_if is None:
+            continue
+
+        cidr = _IP_CIDR_RE.match(line)
+        if cidr:
+            ip_str, prefix = cidr.group(1), int(cidr.group(2))
+            try:
+                network = ipaddress.ip_network(
+                    u"{0}/{1}".format(ip_str, prefix), strict=False
+                )
+            except ValueError:
+                continue
+            results.append({
+                "interface": current_if,
+                "ip": ip_str,
+                "netmask": str(network.netmask),
+                "prefixlen": network.prefixlen,
+            })
+            continue
+
+        dotted = _IP_DOTTED_RE.match(line)
+        if dotted:
+            ip_str, mask_str = dotted.group(1), dotted.group(2)
+            try:
+                network = ipaddress.ip_network(
+                    u"{0}/{1}".format(ip_str, mask_str), strict=False
+                )
+            except ValueError:
+                continue
+            results.append({
+                "interface": current_if,
+                "ip": ip_str,
+                "netmask": mask_str,
+                "prefixlen": network.prefixlen,
+            })
+
+    return results
+
+
+def extract_public_addresses(config_text):
+    """
+    From a running-config, return only the interface addresses that are
+    public (globally routable) IPv4 addresses, each annotated with the
+    calculated subnet ID (network address).
+
+    Private (RFC1918), loopback, link-local, CGNAT (100.64/10), multicast,
+    and other reserved/non-global addresses are skipped.
+    """
+    public = []
+    for entry in parse_interface_addresses(config_text):
+        try:
+            addr = ipaddress.ip_address(u"{0}".format(entry["ip"]))
+        except ValueError:
+            continue
+
+        if not addr.is_global:
+            continue
+
+        network = ipaddress.ip_network(
+            u"{0}/{1}".format(entry["ip"], entry["prefixlen"]), strict=False
+        )
+        public.append({
+            "interface": entry["interface"],
+            "public_ip": entry["ip"],
+            "netmask": entry["netmask"],
+            "prefixlen": entry["prefixlen"],
+            "subnet_id": str(network.network_address),
+        })
+
+    return public
+
+
 def try_connect(host, port, base_device_type, protocol, username, password,
                  secret, timeout, command):
     """
-    Attempt a single connection with one credential/protocol combo.
+    Attempt a single connection with one credential/protocol combo and,
+    on success, capture the output of ``command`` (the config-gathering
+    command).
 
     Returns a dict describing the outcome:
         {
@@ -110,19 +237,21 @@ def try_connect(host, port, base_device_type, protocol, username, password,
     conn = None
     try:
         conn = ConnectHandler(**device_params)
-        # Some platforms need enable() to run privileged show commands.
+        # Reading the running-config requires privileged mode on most
+        # platforms, so enter enable if we are not already privileged.
         try:
             if not conn.check_enable_mode():
                 conn.enable()
         except Exception:
             # Not fatal: some devices/users are already privileged or
             # enable isn't applicable (e.g. read-only views). We still
-            # consider the login itself successful.
+            # consider the login itself successful and try the command.
             pass
 
         output = None
         if command:
-            output = conn.send_command(command)
+            # Config dumps can be long; give the read generous room.
+            output = conn.send_command(command, read_timeout=max(timeout, 60))
 
         return {"ok": True, "error": None, "output": output}
 
@@ -159,7 +288,10 @@ def run_module():
                 secret=dict(type="str", required=False, default=None, no_log=True),
             ),
         ),
-        command=dict(type="str", required=False, default=None),
+        # Command used to retrieve the interface IP configuration. The
+        # default returns dotted-mask (IOS/XE/ASA/XR) or CIDR (NX-OS)
+        # ``ip address`` lines, both of which the parser understands.
+        interface_command=dict(type="str", required=False, default="show running-config"),
         timeout=dict(type="int", required=False, default=15),
     )
 
@@ -181,7 +313,7 @@ def run_module():
     base_device_type = module.params["device_type"]
     protocols = module.params["protocols"]
     credentials = module.params["credentials"]
-    command = module.params["command"]
+    interface_command = module.params["interface_command"]
     timeout = module.params["timeout"]
 
     if not credentials:
@@ -196,7 +328,7 @@ def run_module():
         "status": "fail",
         "protocol_used": None,
         "credential_used": None,
-        "command_output": None,
+        "public_ips": [],
         "attempts": 0,
         "last_error": None,
         "changed": False,
@@ -221,7 +353,7 @@ def run_module():
                 password=password,
                 secret=secret,
                 timeout=timeout,
-                command=command,
+                command=interface_command,
             )
 
             attempts_log.append({
@@ -235,12 +367,13 @@ def run_module():
                 result["status"] = "success"
                 result["protocol_used"] = protocol
                 result["credential_used"] = cred_label
-                result["command_output"] = outcome["output"]
                 result["last_error"] = None
+                result["public_ips"] = extract_public_addresses(outcome["output"] or "")
                 module.exit_json(
-                    msg="Login succeeded on {0} using credential '{1}' over {2}".format(
-                        host, cred_label, protocol
-                    ),
+                    msg="Login succeeded on {0} using credential '{1}' over {2}; "
+                        "found {3} public IP(s)".format(
+                            host, cred_label, protocol, len(result["public_ips"])
+                        ),
                     **result
                 )
             else:
