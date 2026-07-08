@@ -23,7 +23,36 @@ several public IPs produces several rows; a device with none is omitted):
 | `public_ip` | a public IPv4 address configured on an interface |
 | `subnet_mask` | that address's mask in dotted-decimal form |
 | `interface` | the interface the public IP is configured on |
-| `subnet_id` | the network/subnet ID, calculated from the IP + mask |
+| `interface_description` | the interface's configured `description` (empty if none) |
+| `interface_status` | `UP`, `Down`, or `Administratively Down` (see below) |
+| `subnet_id` | the network/subnet ID in CIDR form (`network/prefix`), calculated from the IP + mask |
+
+### Interface status
+
+After reading the config, the module runs a platform-appropriate status
+command on the same session — `show ip interface brief` (IOS/IOS-XE/NX-OS),
+`show ipv4 interface brief` (XR), or `show interface ip brief` (ASA) — and
+maps each interface to `UP` (line and protocol up), `Down`, or
+`Administratively Down`. If the account is not allowed to run that command,
+status falls back to the config itself: `shutdown` present →
+`Administratively Down`, otherwise `Unknown` (UP vs Down can't be told from
+config alone).
+
+## Exclusions log
+
+Every run also writes `output/log_<MMDDYYYY_HH>.log` (e.g.
+`log_07082026_14.log` — month, day, year, hour of the run) listing the
+devices that were **left out of the CSV** and why:
+
+```
+Run: 2026-07-08 14:03 — 1 login failure(s), 1 device(s) with no public IP
+LOGIN_FAILED  old-rtr99 (10.10.9.9) — auth_failed: Authentication to device failed.
+NO_PUBLIC_IP  lan-sw01 (10.10.2.1) — logged in OK, no public IPs found
+```
+
+`LOGIN_FAILED` = every credential/protocol combination failed (the last
+error is included); `NO_PUBLIC_IP` = login worked but no public interface
+IP was found. If nothing was excluded, the log says so.
 
 ## How the cycling works
 
@@ -46,8 +75,10 @@ dotted-mask form (`ip address 203.0.113.1 255.255.255.0`, used by
 IOS/IOS-XE/ASA/XR) and the CIDR form (`ip address 203.0.113.1/24`, used by
 NX-OS), including `secondary` addresses. Each address is classified with
 Python's `ipaddress` module; only **globally routable** addresses are kept.
-The subnet ID is the network address derived from the IP and its mask
-(e.g. `8.8.8.129 / 255.255.255.192` → `8.8.8.128`).
+The interface's `description` and `shutdown` state are picked up from the
+same interface block. The subnet ID is the network derived from the IP and
+its mask, in CIDR form (e.g. `8.8.8.129 / 255.255.255.192` →
+`8.8.8.128/26`).
 
 ## Layout
 
@@ -154,7 +185,8 @@ uv run ansible-playbook -i inventory/hosts.yml site.yml --ask-vault-pass \
     -e interface_command="show running-config interface"
 ```
 
-The CSV lands at `output/public_ip_inventory.csv`.
+The CSV lands at `output/public_ip_inventory.csv`; the exclusions log at
+`output/log_<MMDDYYYY_HH>.log`.
 
 ## Tuning
 

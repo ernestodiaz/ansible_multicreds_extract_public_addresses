@@ -18,11 +18,14 @@
 #      order) from login_protocols (default: telnet then ssh).
 #   2. Stops at the first successful combination per device, then reads the
 #      running config and extracts the device's PUBLIC interface IP
-#      addresses (mask, interface, and calculated subnet ID).
+#      addresses (mask, interface, description, status, and subnet ID in
+#      CIDR form).
 #   3. Writes one JSON fragment per host to a scratch dir (avoids
 #      parallel-fork fact-aggregation issues).
 #   4. A final localhost play merges the fragments into one CSV report with
-#      a row per public IP, skipping devices that have no public IP.
+#      a row per public IP, skipping devices that have no public IP, and
+#      writes a per-run log (output/log_<MMDDYYYY_HH>.log) listing the
+#      excluded devices: login failures and devices with no public IP.
 
 - name: Inspect interface IPs and collect public addresses across network devices
   hosts: network_devices
@@ -44,6 +47,9 @@
   vars:
     results_fragments_dir: "{{ playbook_dir }}/output/.fragments"
     csv_output_path: "{{ playbook_dir }}/output/public_ip_inventory.csv"
+    # Devices excluded from the CSV (login failure / no public IP) are
+    # logged here; one file per run, named log_<MMDDYYYY_HH>.log
+    log_output_path: "{{ playbook_dir }}/output/log_{{ '%m%d%Y_%H' | strftime }}.log"
   tasks:
     - name: Find all per-host result fragments
       find:
@@ -98,20 +104,53 @@
         dest: "{{ csv_output_path }}"
         mode: "0640"
         content: |
-          device_name,management_ip,public_ip,subnet_mask,interface,subnet_id
+          device_name,management_ip,public_ip,subnet_mask,interface,interface_description,interface_status,subnet_id
           {% for device, addr in public_ip_rows %}
-          {{ device.device_name }},{{ device.management_ip }},{{ addr.public_ip }},{{ addr.netmask }},{{ addr.interface }},{{ addr.subnet_id }}
+          {{ device.device_name }},{{ device.management_ip }},{{ addr.public_ip }},{{ addr.netmask }},{{ addr.interface }},"{{ addr.description | default('') | replace('"', '""') }}",{{ addr.status | default('Unknown') }},{{ addr.subnet_id }}
           {% endfor %}
+
+    - name: Identify devices excluded from the CSV
+      set_fact:
+        login_failed_devices: >-
+          {{
+            compiled_results_sorted
+            | selectattr('status', 'equalto', 'fail')
+            | list
+          }}
+        no_public_ip_devices: >-
+          {{
+            compiled_results_sorted
+            | selectattr('status', 'equalto', 'success')
+            | selectattr('public_ips', 'defined')
+            | selectattr('public_ips', 'equalto', [])
+            | list
+          }}
+
+    - name: Write exclusions log (login failures + devices with no public IP)
+      copy:
+        dest: "{{ log_output_path }}"
+        mode: "0640"
+        content: |
+          Run: {{ '%Y-%m-%d %H:%M' | strftime }} — {{ login_failed_devices | length }} login failure(s), {{ no_public_ip_devices | length }} device(s) with no public IP
+          {% for device in login_failed_devices %}
+          LOGIN_FAILED  {{ device.device_name }} ({{ device.management_ip }}) — {{ device.last_error | default('unknown error') }}
+          {% endfor %}
+          {% for device in no_public_ip_devices %}
+          NO_PUBLIC_IP  {{ device.device_name }} ({{ device.management_ip }}) — logged in OK, no public IPs found
+          {% endfor %}
+          {% if (login_failed_devices | length + no_public_ip_devices | length) == 0 %}
+          No devices were excluded from the CSV this run.
+          {% endif %}
 
     - name: Summarize outcome
       vars:
         devices_with_public: "{{ compiled_results_sorted | selectattr('public_ips', 'defined') | rejectattr('public_ips', 'equalto', []) | list | length }}"
-        login_failures: "{{ compiled_results_sorted | selectattr('status', 'equalto', 'fail') | list | length }}"
       debug:
         msg: >-
           Done. {{ public_ip_rows | length }} public IP(s) across
-          {{ devices_with_public }} device(s); {{ login_failures }} device(s)
-          could not be logged into.
+          {{ devices_with_public }} device(s); {{ login_failed_devices | length }} device(s)
+          could not be logged into and {{ no_public_ip_devices | length }} device(s)
+          had no public IP (see {{ log_output_path }}).
           CSV written to {{ csv_output_path }}
 
     - name: Clean up per-host JSON fragments

@@ -9,7 +9,14 @@ list of candidate credentials and a list of candidate protocols (ssh,
 telnet). It stops at the first successful combination. Once connected, it
 pulls the running configuration, parses every interface's configured IPv4
 address + mask, and returns ONLY the public (globally routable) addresses
-together with the interface they live on and their calculated subnet ID.
+together with the interface they live on, the interface's description and
+operational status, and their calculated subnet ID in CIDR form.
+
+Interface status comes from a platform-appropriate ``show ... interface
+brief`` command run on the same session (UP / Down / Administratively
+Down). If that command is unavailable (e.g. a restricted read-only
+account), status falls back to the running config: ``shutdown`` present
+means Administratively Down, otherwise Unknown.
 
 This module intentionally does NOT use Ansible's network connection
 plugins (network_cli) because those require the credential/protocol to
@@ -98,6 +105,7 @@ _IP_CIDR_RE = re.compile(
     r"(\d{1,3}(?:\.\d{1,3}){3})/(\d{1,2})\b"
 )
 _INTERFACE_RE = re.compile(r"^interface\s+(\S+)")
+_DESCRIPTION_RE = re.compile(r"^description\s+(.+)$")
 
 
 def parse_interface_addresses(config_text):
@@ -105,16 +113,25 @@ def parse_interface_addresses(config_text):
     Parse a running-config into a list of configured interface addresses.
 
     Returns a list of dicts:
-        {"interface": str, "ip": str, "netmask": str, "prefixlen": int}
+        {"interface": str, "ip": str, "netmask": str, "prefixlen": int,
+         "description": str, "shutdown": bool}
 
     Cisco configs indent interface sub-commands beneath a top-level
     ``interface <name>`` line and terminate each block with a non-indented
     line (typically ``!``). We track the current interface from the
     indentation, so an ``ip address`` line is always attributed to the
-    interface it belongs to.
+    interface it belongs to. ``description`` and ``shutdown`` may appear
+    before or after the ``ip address`` line, so they are attached to the
+    block's addresses only once the block ends.
     """
     results = []
-    current_if = None
+    current = None  # open interface block
+
+    def flush(block):
+        for addr in block["addresses"]:
+            addr["description"] = block["description"]
+            addr["shutdown"] = block["shutdown"]
+            results.append(addr)
 
     for raw_line in config_text.splitlines():
         if not raw_line.strip():
@@ -126,11 +143,29 @@ def parse_interface_addresses(config_text):
         if not indented:
             # A top-level line ends any interface block. It might itself be
             # the start of a new interface block.
+            if current is not None:
+                flush(current)
+                current = None
             match = _INTERFACE_RE.match(line)
-            current_if = match.group(1) if match else None
+            if match:
+                current = {
+                    "interface": match.group(1),
+                    "description": "",
+                    "shutdown": False,
+                    "addresses": [],
+                }
             continue
 
-        if current_if is None:
+        if current is None:
+            continue
+
+        if line == "shutdown":
+            current["shutdown"] = True
+            continue
+
+        desc = _DESCRIPTION_RE.match(line)
+        if desc:
+            current["description"] = desc.group(1).strip()
             continue
 
         cidr = _IP_CIDR_RE.match(line)
@@ -142,8 +177,8 @@ def parse_interface_addresses(config_text):
                 )
             except ValueError:
                 continue
-            results.append({
-                "interface": current_if,
+            current["addresses"].append({
+                "interface": current["interface"],
                 "ip": ip_str,
                 "netmask": str(network.netmask),
                 "prefixlen": network.prefixlen,
@@ -159,25 +194,99 @@ def parse_interface_addresses(config_text):
                 )
             except ValueError:
                 continue
-            results.append({
-                "interface": current_if,
+            current["addresses"].append({
+                "interface": current["interface"],
                 "ip": ip_str,
                 "netmask": mask_str,
                 "prefixlen": network.prefixlen,
             })
 
+    if current is not None:
+        flush(current)
+
     return results
 
 
-def extract_public_addresses(config_text):
+# Command used to learn each interface's operational status, per Netmiko
+# device family. All produce a "one line per interface" summary the
+# parser below understands.
+STATUS_COMMAND_MAP = {
+    "cisco_ios": "show ip interface brief",
+    "cisco_xe": "show ip interface brief",
+    "cisco_nxos": "show ip interface brief",
+    "cisco_asa": "show interface ip brief",
+    "cisco_xr": "show ipv4 interface brief",
+}
+
+
+def canonical_ifname(name):
+    """
+    Reduce an interface name to a comparable key: the first two letters of
+    the (de-hyphenated) type prefix + the port numbering, lowercased. This
+    lets abbreviated names in brief output match full config names, e.g.
+    "Eth1/1" and "Ethernet1/1" -> "et1/1", "Po10" and "port-channel10"
+    -> "po10".
+    """
+    match = re.match(r"^([A-Za-z\-]+)(.*)$", name.strip())
+    if not match:
+        return name.strip().lower()
+    prefix = match.group(1).replace("-", "").lower()
+    return prefix[:2] + match.group(2).lower()
+
+
+def parse_status_brief(output):
+    """
+    Parse the output of a ``show ... interface brief``-style command into a
+    dict of {canonical interface name: "UP" | "Down" | "Administratively Down"}.
+
+    Handles the IOS/XE/ASA columns (Status + Protocol, where Status can be
+    the two-word "administratively down"), the XR form (Status "Shutdown",
+    trailing VRF column), and the NX-OS form
+    ("protocol-up/link-up/admin-up").
+    """
+    status_map = {}
+    for raw_line in (output or "").splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+        first = line.split()[0]
+        # Interface names start with letters and contain a digit
+        # (GigabitEthernet0/0, Eth1/1, Vlan100, mgmt0). Anything else is a
+        # header/separator/error line.
+        if not re.match(r"^[A-Za-z][A-Za-z\-]*\d", first):
+            continue
+        lower_line = line.lower()
+        lower_tokens = lower_line.split()
+        if ("administratively down" in lower_line
+                or "admin down" in lower_line
+                or "admin-down" in lower_line
+                or "shutdown" in lower_tokens):
+            status = "Administratively Down"
+        elif "protocol-up" in lower_line or lower_tokens.count("up") >= 2:
+            status = "UP"
+        else:
+            status = "Down"
+        status_map[canonical_ifname(first)] = status
+    return status_map
+
+
+def extract_public_addresses(config_text, status_map=None):
     """
     From a running-config, return only the interface addresses that are
     public (globally routable) IPv4 addresses, each annotated with the
-    calculated subnet ID (network address).
+    interface description, interface status, and the calculated subnet ID
+    in CIDR form (network/prefixlen).
 
     Private (RFC1918), loopback, link-local, CGNAT (100.64/10), multicast,
     and other reserved/non-global addresses are skipped.
+
+    ``status_map`` comes from parse_status_brief(). When the interface is
+    not found there (or no map is available), the status falls back to the
+    config itself: "Administratively Down" if the block has ``shutdown``,
+    otherwise "Unknown" — we can't tell UP from Down without operational
+    output, so we don't guess.
     """
+    status_map = status_map or {}
     public = []
     for entry in parse_interface_addresses(config_text):
         try:
@@ -191,29 +300,38 @@ def extract_public_addresses(config_text):
         network = ipaddress.ip_network(
             u"{0}/{1}".format(entry["ip"], entry["prefixlen"]), strict=False
         )
+
+        status = status_map.get(canonical_ifname(entry["interface"]))
+        if status is None:
+            status = "Administratively Down" if entry["shutdown"] else "Unknown"
+
         public.append({
             "interface": entry["interface"],
+            "description": entry["description"],
+            "status": status,
             "public_ip": entry["ip"],
             "netmask": entry["netmask"],
             "prefixlen": entry["prefixlen"],
-            "subnet_id": str(network.network_address),
+            "subnet_id": "{0}/{1}".format(network.network_address, network.prefixlen),
         })
 
     return public
 
 
 def try_connect(host, port, base_device_type, protocol, username, password,
-                 secret, timeout, command):
+                 secret, timeout, command, status_command=None):
     """
     Attempt a single connection with one credential/protocol combo and,
     on success, capture the output of ``command`` (the config-gathering
-    command).
+    command) and, best-effort, of ``status_command`` (the interface-status
+    command; a failure there is not fatal).
 
     Returns a dict describing the outcome:
         {
           "ok": bool,
           "error": str or None,
           "output": str or None,
+          "status_output": str or None,
         }
     """
     device_type = build_device_type(base_device_type, protocol)
@@ -253,16 +371,32 @@ def try_connect(host, port, base_device_type, protocol, username, password,
             # Config dumps can be long; give the read generous room.
             output = conn.send_command(command, read_timeout=max(timeout, 60))
 
-        return {"ok": True, "error": None, "output": output}
+        status_output = None
+        if status_command:
+            # Best effort: a restricted account may not be allowed to run
+            # this; the caller falls back to config-derived status.
+            try:
+                status_output = conn.send_command(
+                    status_command, read_timeout=max(timeout, 30)
+                )
+            except Exception:
+                status_output = None
+
+        return {"ok": True, "error": None, "output": output,
+                "status_output": status_output}
 
     except NetmikoAuthenticationException as exc:
-        return {"ok": False, "error": "auth_failed: " + flatten(str(exc)), "output": None}
+        return {"ok": False, "error": "auth_failed: " + flatten(str(exc)),
+                "output": None, "status_output": None}
     except NetmikoTimeoutException as exc:
-        return {"ok": False, "error": "timeout: " + flatten(str(exc)), "output": None}
+        return {"ok": False, "error": "timeout: " + flatten(str(exc)),
+                "output": None, "status_output": None}
     except (SSHException,) as exc:
-        return {"ok": False, "error": "ssh_error: " + flatten(str(exc)), "output": None}
+        return {"ok": False, "error": "ssh_error: " + flatten(str(exc)),
+                "output": None, "status_output": None}
     except Exception as exc:
-        return {"ok": False, "error": "error: " + flatten(str(exc)), "output": None}
+        return {"ok": False, "error": "error: " + flatten(str(exc)),
+                "output": None, "status_output": None}
     finally:
         if conn is not None:
             try:
@@ -322,6 +456,10 @@ def run_module():
     if not protocols:
         protocols = ["ssh"]
 
+    status_command = STATUS_COMMAND_MAP.get(
+        base_device_type, "show ip interface brief"
+    )
+
     attempts_log = []
     result = {
         "host": host,
@@ -354,6 +492,7 @@ def run_module():
                 secret=secret,
                 timeout=timeout,
                 command=interface_command,
+                status_command=status_command,
             )
 
             attempts_log.append({
@@ -368,7 +507,10 @@ def run_module():
                 result["protocol_used"] = protocol
                 result["credential_used"] = cred_label
                 result["last_error"] = None
-                result["public_ips"] = extract_public_addresses(outcome["output"] or "")
+                status_map = parse_status_brief(outcome.get("status_output") or "")
+                result["public_ips"] = extract_public_addresses(
+                    outcome["output"] or "", status_map
+                )
                 module.exit_json(
                     msg="Login succeeded on {0} using credential '{1}' over {2}; "
                         "found {3} public IP(s)".format(
